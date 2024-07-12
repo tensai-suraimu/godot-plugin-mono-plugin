@@ -2,18 +2,26 @@
 extends EditorPlugin
 
 const MENU_NAME = "Export Plugins"
-const DOCS_NAME = "docs"
 const REPO_NAME = ".mono_repo"
-var plugin
+
+enum FileOperate {
+	COPY_TO_TOP,
+}
+
+const DEF_SECTION_FILES := {
+	# 扫描时忽略这些文件
+	".git/": "IGNORE",
+	".godot/": "IGNORE",
+	"project.godot": "IGNORE",
+	# 输出到 REPO 根目录
+	"docs/": "FLATTEN",
+	"LICENSE": "FLATTEN",
+	"ReadMe.md": "FLATTEN"
+}
 
 
-func _enter_tree():
+func _enter_tree() -> void:
 	add_tool_menu_item(MENU_NAME, _export_mono_plugins)
-
-
-func _exit_tree():
-	_remove_exported_files()
-	remove_tool_menu_item(MENU_NAME)
 
 
 func _plugin_dirs() -> Array[String]:
@@ -30,84 +38,108 @@ func _plugin_dirs() -> Array[String]:
 	addons.list_dir_end()
 	return dirs
 
-func _export_mono_plugins():
+func _export_mono_plugins() -> void:
 	var plugin_dirs := _plugin_dirs()
-	for dir_name in plugin_dirs:
-		_export(dir_name, "res://addons/%s/%s" % [dir_name, REPO_NAME])
-
-func _remove_exported_files():
-	var plugin_dirs := _plugin_dirs()
-	for dir_name in plugin_dirs:
-		_rmtree("res://addons/%s/%s" % [dir_name, REPO_NAME])
+	for addon_name in plugin_dirs:
+		_export(addon_name, "res://addons/%s/%s" % [addon_name, REPO_NAME])
 
 
-
-func _export(dir_name: String, repo_path: String) -> void:
-	# 整理输出目录
-	if not _rmtree(repo_path):
+func _export(addon_name: String, repo_path: String) -> void:
+	# 无 .mono_repo/ 文件夹，忽略
+	if not DirAccess.dir_exists_absolute(repo_path):
 		return
-	DirAccess.make_dir_recursive_absolute("%s/addons/%s" % [repo_path, dir_name])
+	var config := ConfigFile.new()
+	var config_path := "res://addons/%s/plugin.cfg" % addon_name
+	if OK != config.load(config_path):
+		return
+	if true or not config.has_section(REPO_NAME):
+		for name in DEF_SECTION_FILES.keys():
+			var value := DEF_SECTION_FILES[name] as String
+			config.set_value(REPO_NAME, name, value)
+	config.save(config_path)
+	# 整理输出目录
+	_tidy_repo(config, "", repo_path, "")
+
+	DirAccess.make_dir_recursive_absolute("%s/addons/%s" % [repo_path, addon_name])
 	# 自动创建 .gitignore 并排除 .mono_repo/ 目录
-	var gitignore := "res://addons/%s/%s" % [dir_name, ".gitignore"]
+	var gitignore := "res://addons/%s/%s" % [addon_name, ".gitignore"]
 	if not FileAccess.file_exists(gitignore):
 		var file := FileAccess.open(gitignore, FileAccess.WRITE)
 		file.store_line("%s/" % REPO_NAME)
 		file.close()
-
-	# 将插件目录下内容整理并拷贝到输出目录
-	var from_dir := DirAccess.open("res://addons/%s" % dir_name)
-	from_dir.include_hidden = true
-	from_dir.list_dir_begin()
-	var name := from_dir.get_next()
-	while name != "":
-		var from := "res://addons/%s/%s" % [dir_name, name]
-		var dest := "%s/addons/%s/%s" % [repo_path, dir_name, name]
-		if from_dir.current_is_dir():
-			if name == DOCS_NAME:
-				_cptree(from, "%s/%s" % [repo_path, name])
-			if name != REPO_NAME:
-				_cptree(from, dest)
-		elif name.ends_with(".md"):
-			# 顶层的 Markdown 文件特殊处理，放到仓库根目录
-			DirAccess.copy_absolute(from, "%s/%s" % [repo_path, name])
-		else:
-			DirAccess.copy_absolute(from, dest)
-		name = from_dir.get_next()
-	from_dir.list_dir_end()
+	# 拷贝插件目录
+	_cptree(config, "", "res://addons/%s" % addon_name, "")
 
 
-func _rmtree(path: String) -> bool:
-	var dir := DirAccess.open(path)
+func _tidy_repo(config: ConfigFile, operate: String, root: String, path: String) -> void:
+	var dir := DirAccess.open("%s/%s" % [root, path])
 	if not dir:
-		return false
+		return
 	dir.include_hidden = true
 	dir.list_dir_begin()
 	var name := dir.get_next()
 	while name != "":
 		if dir.current_is_dir():
-			if name != '.git':
-				_rmtree("%s/%s" % [path, name])
-		dir.remove(name)
+			var next := "%s%s/" % [path, name]
+			var oper := config.get_value(REPO_NAME, next, operate)
+			if oper != "IGNORE":
+				_tidy_repo(config, oper, root, next)
+		else:
+			var next := "%s%s" % [path, name]
+			var oper := config.get_value(REPO_NAME, next, operate)
+			if oper != "IGNORE":
+				var source := (
+					"%s/../%s" % [root, next]
+				) if oper == "FLATTEN" else (
+					"res://%s" % next
+				)
+				var output := "%s/%s" % [root, next]
+				_tidy_file(source, output)
 		name = dir.get_next()
 	dir.list_dir_end()
-	return true
 
+func _tidy_file(source: String, output: String) -> void:
+	var src_mod_at := FileAccess.get_modified_time(source)
+	var out_mod_at := FileAccess.get_modified_time(output)
+	# 若源文件已删除，输出文件也一起删除
+	if src_mod_at <= 0 or not FileAccess.file_exists(source):
+		DirAccess.remove_absolute(output)
+		return
+	# 输出文件无效，正常情况下不应该出现
+	if out_mod_at <= 0 or not FileAccess.file_exists(output):
+		return
+	# 输出文件较新（被修改了），覆盖回去
+	if src_mod_at < out_mod_at:
+		DirAccess.copy_absolute(output, source)
 
-func _cptree(from_dir: String, dest_dir: String) -> bool:
-	var dir := DirAccess.open(from_dir)
+func _cptree(config: ConfigFile, operate: String, root: String, path: String) -> void:
+	var dir := DirAccess.open("%s/%s" % [root, path])
 	if not dir:
-		return false
+		return
 	dir.include_hidden = true
 	dir.list_dir_begin()
 	var name := dir.get_next()
 	while name != "":
-		var from := "%s/%s" % [from_dir, name]
-		var dest := "%s/%s" % [dest_dir, name]
 		if dir.current_is_dir():
-			_cptree(from, dest)
+			if name == REPO_NAME:
+				name = dir.get_next()
+				continue
+			var next := "%s%s/" % [path, name]
+			var oper := config.get_value(REPO_NAME, next, operate)
+			if oper != "IGNORE":
+				_cptree(config, oper, root, next)
 		else:
-			DirAccess.make_dir_recursive_absolute(dest_dir)
-			DirAccess.copy_absolute(from, dest)
+			var next := "%s%s" % [path, name]
+			var oper := config.get_value(REPO_NAME, next, operate)
+			if oper != "IGNORE":
+				var source := "%s/%s" % [root, next]
+				var output := (
+					"%s/%s/%s" % [root, REPO_NAME, next]
+				) if oper == "FLATTEN" else (
+					"%s/%s/%s/%s" % [root, REPO_NAME, root.substr(6), next]
+				)
+				var out_dir := output.substr(0, output.rfind("/"))
+				DirAccess.make_dir_recursive_absolute(out_dir)
+				DirAccess.copy_absolute(source, output)
 		name = dir.get_next()
 	dir.list_dir_end()
-	return true

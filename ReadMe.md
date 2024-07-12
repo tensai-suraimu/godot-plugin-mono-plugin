@@ -46,3 +46,4 @@
 ## TODO List
 
 - [ ] Git integration.
+- [x] Configuable directory structure.
